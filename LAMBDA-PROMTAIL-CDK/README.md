@@ -33,5 +33,5 @@ Edit `cdk.json`:
 
 - `log_group_names` - CloudWatch Logs
 - `bucket_names` - S3 buckets
-- `kinesis_stream_name` - Kinesis streams (must exist)
-- `sqs_enabled` - Use SQS for S3 (high volume)
+- `kinesis_stream_name` - Kinesis streams
+- `sqs_enabled` - Use SQS for S3
