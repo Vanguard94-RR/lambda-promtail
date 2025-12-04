@@ -4,6 +4,7 @@ from aws_cdk import (
     aws_lambda as lambda_,
     aws_iam as iam,
     aws_logs as logs,
+    aws_s3 as s3,
 )
 from constructs import Construct
 
@@ -15,10 +16,17 @@ class LambdaPromtailFunction(Construct):
         self.config = config
         self.role = role
         
-        # build environment vars
         env = self._build_env()
         
-        # figure out how to deploy
+        # create log group first so we control retention
+        function_name = config.get("name", "lambda_promtail")
+        log_group = logs.LogGroup(
+            self, "Logs",
+            log_group_name=f"/aws/lambda/{function_name}",
+            retention=self._retention_days(config.get("log_retention_days", 14))
+        )
+        
+        # deploy method
         method = config.get("deployment_method", "asset")
         
         if method == "image":
@@ -28,35 +36,29 @@ class LambdaPromtailFunction(Construct):
         else:
             self.function = self._create_from_asset(env)
         
-        # setup log retention
-        logs.LogGroup(
-            self, "Logs",
-            log_group_name=f"/aws/lambda/{self.function.function_name}",
-            retention=self._retention_days(config.get("log_retention_days", 14))
-        )
+        self.function.node.add_dependency(log_group)
     
     def _create_from_asset(self, env):
-        # check if bootstrap binary already exists
+        # check for pre-built binary
         bootstrap = os.path.join(os.path.dirname(__file__), "..", "bootstrap")
         
         if os.path.exists(bootstrap):
-            # use pre-built binary (fastest)
             code = lambda_.Code.from_asset(".", exclude=["*", "!bootstrap"])
         else:
             # build from source with docker
-            source_path = self.config.get("lambda_source_path", "..")
+            source_path = os.path.join(os.path.dirname(__file__), "..", "..")
             code = lambda_.Code.from_asset(
                 source_path,
                 bundling=lambda_.BundlingOptions(
                     image=lambda_.Runtime.GO_1_X.bundling_image,
                     command=[
                         "bash", "-c",
-                        "GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o /asset-output/bootstrap -ldflags='-s -w' ./..."
+                        "cd /asset-input/pkg && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOFLAGS=-trimpath go build -mod=readonly -o /asset-output/bootstrap -ldflags='-s -w'"
                     ],
                 ),
             )
         
-        return lambda_.Function(
+        func = lambda_.Function(
             self, "Fn",
             function_name=self.config.get("name", "lambda_promtail"),
             runtime=lambda_.Runtime.PROVIDED_AL2023,
@@ -68,20 +70,30 @@ class LambdaPromtailFunction(Construct):
             memory_size=self.config.get("lambda_memory", 128),
             reserved_concurrent_executions=self.config.get("reserved_concurrent_executions"),
         )
+        
+        # vpc config if needed
+        if subnets := self.config.get("lambda_vpc_subnets"):
+            cfn_func = func.node.default_child
+            cfn_func.vpc_config = lambda_.CfnFunction.VpcConfigProperty(
+                subnet_ids=subnets,
+                security_group_ids=self.config.get("lambda_vpc_security_groups", [])
+            )
+        
+        return func
     
     def _create_from_s3(self, env):
-        bucket = self.config.get("s3_bucket")
-        key = self.config.get("s3_key", "lambda-promtail.zip")
+        bucket = self.config.get("lambda_promtail_binary_bucket")
+        key = self.config.get("lambda_promtail_binary_key", "lambda-promtail.zip")
         
         if not bucket:
-            raise ValueError("s3_bucket required when deployment_method is s3")
+            raise ValueError("lambda_promtail_binary_bucket required when deployment_method is s3")
         
-        return lambda_.Function(
+        func = lambda_.Function(
             self, "Fn",
             function_name=self.config.get("name", "lambda_promtail"),
             runtime=lambda_.Runtime.PROVIDED_AL2023,
             code=lambda_.Code.from_bucket(
-                bucket=lambda_.Bucket.from_bucket_name(self, "Bucket", bucket),
+                bucket=s3.Bucket.from_bucket_name(self, "S3Bucket", bucket),
                 key=key
             ),
             handler="bootstrap",
@@ -90,12 +102,21 @@ class LambdaPromtailFunction(Construct):
             timeout=Duration.seconds(self.config.get("lambda_timeout", 60)),
             memory_size=self.config.get("lambda_memory", 128),
         )
+        
+        if subnets := self.config.get("lambda_vpc_subnets"):
+            cfn_func = func.node.default_child
+            cfn_func.vpc_config = lambda_.CfnFunction.VpcConfigProperty(
+                subnet_ids=subnets,
+                security_group_ids=self.config.get("lambda_vpc_security_groups", [])
+            )
+        
+        return func
     
     def _create_from_image(self, env):
-        image_uri = self.config.get("image_uri")
+        image_uri = self.config.get("lambda_promtail_image")
         
         if not image_uri:
-            raise ValueError("image_uri required when deployment_method is image")
+            raise ValueError("lambda_promtail_image required when deployment_method is image")
         
         # parse ECR image URI
         if ":" in image_uri:
@@ -108,7 +129,7 @@ class LambdaPromtailFunction(Construct):
         from aws_cdk import aws_ecr as ecr
         repo = ecr.Repository.from_repository_name(self, "Repo", repo_name)
         
-        return lambda_.DockerImageFunction(
+        func = lambda_.DockerImageFunction(
             self, "Fn",
             function_name=self.config.get("name", "lambda_promtail"),
             code=lambda_.DockerImageCode.from_ecr(repo, tag=tag),
@@ -117,6 +138,16 @@ class LambdaPromtailFunction(Construct):
             timeout=Duration.seconds(self.config.get("lambda_timeout", 60)),
             memory_size=self.config.get("lambda_memory", 128),
         )
+        
+        # Add VPC config if provided
+        if subnets := self.config.get("lambda_vpc_subnets"):
+            cfn_func = func.node.default_child
+            cfn_func.vpc_config = lambda_.CfnFunction.VpcConfigProperty(
+                subnet_ids=subnets,
+                security_group_ids=self.config.get("lambda_vpc_security_groups", [])
+            )
+        
+        return func
     
     def _build_env(self):
         c = self.config

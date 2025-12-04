@@ -21,38 +21,36 @@ class LambdaPromtailStack(Stack):
         
         self.config = config
         
-        # basic validation
-        if not config.get("write_address"):
-            raise ValueError("write_address is required")
+        # warn if write_address not set
+        write_addr = config.get("write_address", "")
+        if not write_addr:
+            print("⚠️  WARNING: write_address not configured")
         
-        # check auth setup
+        # check auth
         has_basic = config.get("username") and config.get("password")
         has_token = config.get("bearer_token")
         if has_basic and has_token:
             raise ValueError("use either basic auth or bearer token, not both")
         
-        # create IAM role
         self.role = iam.Role(
             self, "Role",
             role_name=config.get("name", "lambda_promtail"),
             assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
         )
         
-        # add cloudwatch logs permissions if not in VPC
+        # cloudwatch logs permissions (not needed if VPC)
         if not config.get("lambda_vpc_subnets"):
             self.role.add_to_policy(iam.PolicyStatement(
                 actions=["logs:CreateLogStream", "logs:PutLogEvents"],
                 resources=[f"arn:aws:logs:{self.region}:{self.account}:log-group:/aws/lambda/{config.get('name', 'lambda_promtail')}:*"]
             ))
         
-        # create lambda function
         self.function = LambdaPromtailFunction(
             self, "Function",
             config=config,
             role=self.role
         )
         
-        # configure retries
         lambda_.EventInvokeConfig(
             self, "InvokeConfig",
             function=self.function.function,
@@ -60,10 +58,7 @@ class LambdaPromtailStack(Stack):
             retry_attempts=2,
         )
         
-        # add IAM permissions for data sources
         self._add_permissions()
-        
-        # wire up event sources
         self._setup_event_sources()
     
     def _add_permissions(self):
@@ -76,7 +71,7 @@ class LambdaPromtailStack(Stack):
             ))
         
         # Kinesis streams
-        streams = self.config.get("kinesis_stream_names", [])
+        streams = self.config.get("kinesis_stream_name", [])
         if streams:
             self.role.add_to_policy(iam.PolicyStatement(
                 actions=["kinesis:DescribeStream", "kinesis:GetRecords", 
@@ -133,7 +128,15 @@ class LambdaPromtailStack(Stack):
     
     def _setup_event_sources(self):
         # CloudWatch Logs
-        for log_group in self.config.get("log_group_names", []):
+        log_groups = self.config.get("log_group_names", [])
+        if log_groups:
+            self.function.function.add_permission(
+                "AllowCloudWatchLogs",
+                principal=iam.ServicePrincipal(f"logs.{self.region}.amazonaws.com"),
+                action="lambda:InvokeFunction"
+            )
+        
+        for log_group in log_groups:
             lg = logs.LogGroup.from_log_group_name(
                 self, f"LogGroup{self._clean_id(log_group)}", log_group
             )
@@ -153,7 +156,7 @@ class LambdaPromtailStack(Stack):
                 self._setup_s3_direct(buckets)
         
         # Kinesis streams
-        for stream_name in self.config.get("kinesis_stream_names", []):
+        for stream_name in self.config.get("kinesis_stream_name", []):
             stream = kinesis.Stream.from_stream_attributes(
                 self, f"Stream{self._clean_id(stream_name)}",
                 stream_arn=f"arn:aws:kinesis:{self.region}:{self.account}:stream/{stream_name}"
@@ -170,6 +173,14 @@ class LambdaPromtailStack(Stack):
     def _setup_s3_direct(self, buckets):
         for bucket_name in buckets:
             bucket = s3.Bucket.from_bucket_name(self, f"Bucket{self._clean_id(bucket_name)}", bucket_name)
+            
+            self.function.function.add_permission(
+                f"AllowS3Invoke{self._clean_id(bucket_name)}",
+                principal=iam.ServicePrincipal("s3.amazonaws.com"),
+                action="lambda:InvokeFunction",
+                source_arn=f"arn:aws:s3:::{bucket_name}"
+            )
+            
             bucket.add_event_notification(
                 s3.EventType.OBJECT_CREATED,
                 s3n.LambdaDestination(self.function.function),
@@ -198,7 +209,6 @@ class LambdaPromtailStack(Stack):
             dead_letter_queue=sqs.DeadLetterQueue(max_receive_count=5, queue=dlq)
         )
         
-        # connect S3 buckets to queue
         for bucket_name in buckets:
             bucket = s3.Bucket.from_bucket_name(self, f"BucketSQS{self._clean_id(bucket_name)}", bucket_name)
             bucket.add_event_notification(
@@ -210,7 +220,6 @@ class LambdaPromtailStack(Stack):
                 )
             )
         
-        # connect queue to lambda
         self.function.function.add_event_source(SqsEventSource(queue, batch_size=10))
     
     def _clean_id(self, name):

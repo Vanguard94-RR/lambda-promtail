@@ -76,7 +76,7 @@
       "region": null,
       "log_group_names": [],
       "bucket_names": [],
-      "kinesis_stream_names": [],
+      "kinesis_stream_name": [],
       "filter_prefix": "AWSLogs/",
       "filter_suffix": ".gz",
       "username": "",
